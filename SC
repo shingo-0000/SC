@@ -53,13 +53,15 @@ local BODY_PARTS = {
     RightFoot = true
 }
 
+-- Humanoid's actual R15 NumberValue names. In particular, the proportion
+-- value is named BodyProportionScale (not ProportionScale).
 local SCALE_NAMES = {
     "BodyHeightScale",
     "BodyWidthScale",
     "BodyDepthScale",
     "HeadScale",
     "BodyTypeScale",
-    "ProportionScale"
+    "BodyProportionScale"
 }
 
 local function restoreAppearance(target)
@@ -135,12 +137,20 @@ local function restoreAppearance(target)
                 end)
             end
 
-            -- Restore original body scales
+            -- Restore original body scales, then restore the Humanoid's
+            -- previous automatic-scaling setting.
             for obj, value in pairs(state.scales) do
                 pcall(function()
                     if obj.Parent then
                         obj.Value = value
                     end
+                end)
+            end
+
+            if state.humanoid and state.humanoid.Parent
+                and state.automaticScalingEnabled ~= nil then
+                pcall(function()
+                    state.humanoid.AutomaticScalingEnabled = state.automaticScalingEnabled
                 end)
             end
         end
@@ -403,6 +413,17 @@ local function applyAppearance(target, username)
             description =
                 Players:GetHumanoidDescriptionFromUserIdAsync(userId)
 
+            -- Keep the scale values directly from the avatar description as
+            -- a fallback in case the generated preview rig omits a scale child.
+            local descriptionScales = {
+                BodyHeightScale = description.HeightScale,
+                BodyWidthScale = description.WidthScale,
+                BodyDepthScale = description.DepthScale,
+                HeadScale = description.HeadScale,
+                BodyTypeScale = description.BodyTypeScale,
+                BodyProportionScale = description.ProportionScale
+            }
+
             -- Temporary appearance model.
             -- This model is not used as the target character.
             preview = Players:CreateHumanoidModelFromDescriptionAsync(
@@ -423,6 +444,8 @@ local function applyAppearance(target, username)
             local state = {
                 target = target,
                 character = character,
+                humanoid = humanoid,
+                automaticScalingEnabled = humanoid.AutomaticScalingEnabled,
                 added = {},
                 originals = {},
                 colors = {},
@@ -495,21 +518,27 @@ local function applyAppearance(target, username)
                 end
             end
 
-            -- Copy existing R15 scaling values only.
-            if previewHumanoid then
+            -- Copy the source avatar's R15 body proportions. Roblox only
+            -- applies these NumberValues when AutomaticScalingEnabled is true.
+            if humanoid.RigType == Enum.HumanoidRigType.R15 then
+                humanoid.AutomaticScalingEnabled = true
+
                 for _, name in ipairs(SCALE_NAMES) do
-                    local sourceValue =
-                        previewHumanoid:FindFirstChild(name)
+                    local targetValue = humanoid:FindFirstChild(name)
+                    local sourceValue = previewHumanoid
+                        and previewHumanoid:FindFirstChild(name)
 
-                    local targetValue =
-                        humanoid:FindFirstChild(name)
+                    local sourceScale
+                    if sourceValue and sourceValue:IsA("NumberValue") then
+                        sourceScale = sourceValue.Value
+                    else
+                        sourceScale = descriptionScales[name]
+                    end
 
-                    if sourceValue and targetValue
-                        and sourceValue:IsA("NumberValue")
-                        and targetValue:IsA("NumberValue") then
-
+                    if targetValue and targetValue:IsA("NumberValue")
+                        and sourceScale ~= nil then
                         state.scales[targetValue] = targetValue.Value
-                        targetValue.Value = sourceValue.Value
+                        targetValue.Value = sourceScale
                     end
                 end
             end
