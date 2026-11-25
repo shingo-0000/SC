@@ -1,0 +1,1505 @@
+--==================================================
+-- SHINGO'S CHANGER V6
+-- Multi-target avatar appearance + display-name editor
+--==================================================
+
+if _G.AppearanceChangerCleanup then
+    pcall(_G.AppearanceChangerCleanup)
+end
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+-- States are stored per target so multiple players can keep different
+-- local-only appearances and display names at the same time.
+local activeAppearanceStates = {}
+local activeNameTagStates = {}
+local selectedPlayer
+local status, nameStatus
+local refreshAppearancePlayers, refreshNamePlayers
+local busyTargets = {}
+local connections = {}
+
+local function connect(signal, callback)
+    local c = signal:Connect(callback)
+    table.insert(connections, c)
+    return c
+end
+
+local BODY_PARTS = {
+    Head = true,
+    Torso = true,
+    ["Left Arm"] = true,
+    ["Right Arm"] = true,
+    ["Left Leg"] = true,
+    ["Right Leg"] = true,
+    UpperTorso = true,
+    LowerTorso = true,
+    LeftUpperArm = true,
+    LeftLowerArm = true,
+    LeftHand = true,
+    RightUpperArm = true,
+    RightLowerArm = true,
+    RightHand = true,
+    LeftUpperLeg = true,
+    LeftLowerLeg = true,
+    LeftFoot = true,
+    RightUpperLeg = true,
+    RightLowerLeg = true,
+    RightFoot = true
+}
+
+local SCALE_NAMES = {
+    "BodyHeightScale",
+    "BodyWidthScale",
+    "BodyDepthScale",
+    "HeadScale",
+    "BodyTypeScale",
+    "ProportionScale"
+}
+
+local function restoreAppearance(target)
+    local targetsToRestore = {}
+
+    if target then
+        table.insert(targetsToRestore, target)
+    else
+        for player in pairs(activeAppearanceStates) do
+            table.insert(targetsToRestore, player)
+        end
+    end
+
+    for _, player in ipairs(targetsToRestore) do
+        local state = activeAppearanceStates[player]
+        if state then
+            activeAppearanceStates[player] = nil
+
+            if state.respawnConnection then
+                pcall(function()
+                    state.respawnConnection:Disconnect()
+                end)
+            end
+
+            -- Keep original rig joints alive while their temporary parent
+            -- body-part clones are destroyed. They are reattached below.
+            for joint in pairs(state.joints or {}) do
+                pcall(function()
+                    if joint and joint.Parent then
+                        joint.Parent = state.character
+                    end
+                end)
+            end
+
+            -- Remove new objects, including cloned body parts and Dynamic Head.
+            for _, obj in ipairs(state.added) do
+                pcall(function()
+                    obj:Destroy()
+                end)
+            end
+
+            -- Restore original objects, including the original head if it
+            -- was temporarily replaced by a dynamic head.
+            for _, entry in ipairs(state.originals) do
+                pcall(function()
+                    if entry.object then
+                        entry.object.Parent = entry.parent
+                    end
+                end)
+            end
+
+            -- Restore original joint endpoints after all original body parts return.
+            for joint, original in pairs(state.joints or {}) do
+                pcall(function()
+                    if joint then
+                        joint.Part0 = original.Part0
+                        joint.Part1 = original.Part1
+                        joint.C0 = original.C0
+                        joint.C1 = original.C1
+                        if original.Parent then
+                            joint.Parent = original.Parent
+                        end
+                    end
+                end)
+            end
+
+            -- Restore original body colors
+            for part, color in pairs(state.colors) do
+                pcall(function()
+                    if part.Parent then
+                        part.Color = color
+                    end
+                end)
+            end
+
+            -- Restore original body scales
+            for obj, value in pairs(state.scales) do
+                pcall(function()
+                    if obj.Parent then
+                        obj.Value = value
+                    end
+                end)
+            end
+        end
+    end
+end
+
+local function saveAndRemove(obj, state)
+    table.insert(state.originals, {
+        object = obj,
+        parent = obj.Parent
+    })
+
+    obj.Parent = nil
+end
+
+local function getBodyParts(character)
+    local result = {}
+
+    for _, obj in ipairs(character:GetChildren()) do
+        if obj:IsA("BasePart") and BODY_PARTS[obj.Name] then
+            result[obj.Name] = obj
+        end
+    end
+
+    return result
+end
+
+local function applyAccessory(accessory, character, state, bodyParts)
+    local clone = accessory:Clone()
+    local handle = clone:FindFirstChild("Handle")
+
+    if not handle then
+        clone:Destroy()
+        return false
+    end
+
+    clone.Parent = character
+
+    -- Remove any weld that still refers to the preview rig
+    for _, obj in ipairs(handle:GetDescendants()) do
+        if obj:IsA("Weld") and obj.Name == "AccessoryWeld" then
+            obj:Destroy()
+        end
+    end
+
+    handle.CanCollide = false
+    handle.CanTouch = false
+    handle.CanQuery = false
+    handle.Massless = true
+    handle.Anchored = false
+
+    local attached = false
+
+    for _, handleAttachment in ipairs(handle:GetDescendants()) do
+        if handleAttachment:IsA("Attachment") then
+            for _, bodyPart in pairs(bodyParts) do
+                local targetAttachment =
+                    bodyPart:FindFirstChild(handleAttachment.Name, true)
+
+                if targetAttachment and
+                    targetAttachment:IsA("Attachment") then
+
+                    local weld = Instance.new("Weld")
+                    weld.Name = "AccessoryWeld"
+                    weld.Part0 = bodyPart
+                    weld.Part1 = handle
+                    weld.C0 = targetAttachment.CFrame
+                    weld.C1 = handleAttachment.CFrame
+                    weld.Parent = handle
+
+                    attached = true
+                    break
+                end
+            end
+        end
+
+        if attached then break end
+    end
+
+    if not attached then
+        clone:Destroy()
+        return false
+    end
+
+    table.insert(state.added, clone)
+    return true
+end
+
+local function copyObject(source, destination, state)
+    if not source then return end
+
+    local clone = source:Clone()
+    clone.Parent = destination
+
+    table.insert(state.added, clone)
+end
+
+-- Replace the target's body-part instances with the matching instances from
+-- the source preview rig. This carries bundle meshes, textures, attachments,
+-- WrapTargets, and (for Dynamic Heads) FaceControls/face-rig data together.
+local function replaceBodyPart(sourcePart, targetPart, character, state)
+    if not sourcePart or not targetPart then
+        return targetPart
+    end
+
+    local clone = sourcePart:Clone()
+    clone.Name = targetPart.Name
+    clone.CFrame = targetPart.CFrame
+    clone.Anchored = false
+    clone.CanCollide = targetPart.CanCollide
+    clone.CanTouch = targetPart.CanTouch
+    clone.CanQuery = targetPart.CanQuery
+    clone.Massless = targetPart.Massless
+
+    -- Joints belong to the rig, not the mesh. Remove any joint instances
+    -- cloned from the preview part; the target's original joints are reused.
+    for _, child in ipairs(clone:GetDescendants()) do
+        if child:IsA("Motor6D") then
+            child:Destroy()
+        end
+    end
+    clone.Parent = character
+
+    -- Preserve target joints before detaching the old body part. Some rigs
+    -- parent Motor6Ds beneath the part being replaced, so reparent those too.
+    for _, obj in ipairs(character:GetDescendants()) do
+        if obj:IsA("Motor6D") then
+            local changesPart = obj.Part0 == targetPart or obj.Part1 == targetPart
+            if changesPart then
+                if not state.joints[obj] then
+                    state.joints[obj] = {
+                        Part0 = obj.Part0,
+                        Part1 = obj.Part1,
+                        C0 = obj.C0,
+                        C1 = obj.C1,
+                        Parent = obj.Parent
+                    }
+                end
+                if obj.Part0 == targetPart then
+                    obj.Part0 = clone
+                end
+                if obj.Part1 == targetPart then
+                    obj.Part1 = clone
+                end
+                if obj.Parent == targetPart or obj.Parent:IsDescendantOf(targetPart) then
+                    obj.Parent = character
+                end
+            end
+        end
+    end
+
+    saveAndRemove(targetPart, state)
+    table.insert(state.added, clone)
+    return clone
+end
+
+local function copyAvatarJointOffsets(preview, character, state)
+    local sourceJoints = {}
+    for _, obj in ipairs(preview:GetDescendants()) do
+        if obj:IsA("Motor6D") then
+            sourceJoints[obj.Name] = obj
+        end
+    end
+
+    for _, joint in ipairs(character:GetDescendants()) do
+        if joint:IsA("Motor6D") then
+            local source = sourceJoints[joint.Name]
+            if source then
+                if not state.joints[joint] then
+                    state.joints[joint] = {
+                        Part0 = joint.Part0,
+                        Part1 = joint.Part1,
+                        C0 = joint.C0,
+                        C1 = joint.C1,
+                        Parent = joint.Parent
+                    }
+                end
+                joint.C0 = source.C0
+                joint.C1 = source.C1
+            end
+        end
+    end
+end
+
+local function replaceAvatarBodyParts(preview, character, state)
+    local sourceParts = getBodyParts(preview)
+    local targetParts = getBodyParts(character)
+    local replaced = {}
+
+    for name, targetPart in pairs(targetParts) do
+        local sourcePart = sourceParts[name]
+        if sourcePart then
+            replaced[name] = replaceBodyPart(
+                sourcePart,
+                targetPart,
+                character,
+                state
+            )
+        else
+            replaced[name] = targetPart
+        end
+    end
+
+    return replaced
+end
+
+local function applyAppearance(target, username)
+    if not target then
+        status.Text = "STATUS  /  Select a player first"
+        return
+    end
+
+    if busyTargets[target] then
+        status.Text = "STATUS  /  This player's avatar is still loading"
+        return
+    end
+
+    if not target.Character then
+        status.Text = "STATUS  /  Target character not found"
+        return
+    end
+
+    if username == "" then
+        status.Text = "STATUS  /  Enter a username"
+        return
+    end
+
+    busyTargets[target] = true
+    status.Text = "STATUS  /  Retrieving avatar data for @" .. target.Name .. "..."
+
+    task.spawn(function()
+        local preview
+        local description
+        local success, err = pcall(function()
+            -- Re-applying to one player replaces only that player's override.
+            restoreAppearance(target)
+
+            local character = target.Character
+            local humanoid =
+                character:FindFirstChildOfClass("Humanoid")
+
+            if not humanoid then
+                error("Target Humanoid not found")
+            end
+
+            local userId
+
+            if username:match("^%d+$") then
+                userId = tonumber(username)
+            else
+                userId = Players:GetUserIdFromNameAsync(username)
+            end
+
+            if not userId then
+                error("Username not found")
+            end
+
+            status.Text = "STATUS  /  Loading avatar appearance..."
+
+            description =
+                Players:GetHumanoidDescriptionFromUserIdAsync(userId)
+
+            -- Temporary appearance model.
+            -- This model is not used as the target character.
+            preview = Players:CreateHumanoidModelFromDescriptionAsync(
+                description,
+                humanoid.RigType
+            )
+
+            description:Destroy()
+            description = nil
+
+            if not preview then
+                error("Failed to create avatar model")
+            end
+
+            local previewHumanoid =
+                preview:FindFirstChildOfClass("Humanoid")
+
+            local state = {
+                target = target,
+                character = character,
+                added = {},
+                originals = {},
+                colors = {},
+                scales = {},
+                joints = {}
+            }
+
+            activeAppearanceStates[target] = state
+
+            -- Restore automatically if this target respawns.
+            state.respawnConnection =
+                target.CharacterAdded:Connect(function()
+                    if activeAppearanceStates[target] == state then
+                        restoreAppearance(target)
+                        status.Text = "STATUS  /  Restored after @" .. target.Name .. " respawn"
+                    end
+                end)
+
+            -- Bring across the complete source body rig, including body
+            -- bundle geometry and the full Dynamic Head when present.
+            local targetParts = replaceAvatarBodyParts(preview, character, state)
+
+            -- Save and remove original cosmetic objects
+            for _, obj in ipairs(character:GetChildren()) do
+                if obj:IsA("Accessory")
+                    or obj:IsA("Shirt")
+                    or obj:IsA("Pants")
+                    or obj:IsA("ShirtGraphic")
+                    or obj:IsA("BodyColors") then
+
+                    saveAndRemove(obj, state)
+                end
+            end
+
+            -- Body colors
+            local previewColors =
+                preview:FindFirstChildOfClass("BodyColors")
+
+            if previewColors then
+                copyObject(previewColors, character, state)
+            end
+
+            -- Clothes
+            copyObject(
+                preview:FindFirstChildOfClass("Shirt"),
+                character,
+                state
+            )
+
+            copyObject(
+                preview:FindFirstChildOfClass("Pants"),
+                character,
+                state
+            )
+
+            copyObject(
+                preview:FindFirstChildOfClass("ShirtGraphic"),
+                character,
+                state
+            )
+
+            -- The copied Head already contains the source face, Dynamic Head
+            -- rig and attachments. Body-part clones also carry bundle meshes.
+            local sourceParts = getBodyParts(preview)
+            for name, targetPart in pairs(targetParts) do
+                local sourcePart = sourceParts[name]
+                if sourcePart then
+                    state.colors[targetPart] = targetPart.Color
+                    targetPart.Color = sourcePart.Color
+                end
+            end
+
+            -- Copy existing R15 scaling values only.
+            if previewHumanoid then
+                for _, name in ipairs(SCALE_NAMES) do
+                    local sourceValue =
+                        previewHumanoid:FindFirstChild(name)
+
+                    local targetValue =
+                        humanoid:FindFirstChild(name)
+
+                    if sourceValue and targetValue
+                        and sourceValue:IsA("NumberValue")
+                        and targetValue:IsA("NumberValue") then
+
+                        state.scales[targetValue] = targetValue.Value
+                        targetValue.Value = sourceValue.Value
+                    end
+                end
+            end
+
+            -- Copy source rig joint offsets so package proportions and limb
+            -- transitions match the selected avatar as closely as possible.
+            copyAvatarJointOffsets(preview, character, state)
+
+            -- Copy accessories and attach to the replaced body parts.
+            local accessoryCount = 0
+
+            for _, obj in ipairs(preview:GetChildren()) do
+                if obj:IsA("Accessory") then
+                    if applyAccessory(
+                        obj,
+                        character,
+                        state,
+                        targetParts
+                    ) then
+                        accessoryCount += 1
+                    end
+                end
+            end
+
+            preview:Destroy()
+            preview = nil
+
+            status.Text =
+                "STATUS  /  Applied successfully / Accessories: " ..
+                accessoryCount .. ""
+        end)
+
+        if preview then
+            pcall(function()
+                preview:Destroy()
+            end)
+        end
+
+        if description then
+            pcall(function()
+                description:Destroy()
+            end)
+        end
+
+        if not success then
+            restoreAppearance(target)
+            status.Text = "ERROR  /  " .. tostring(err)
+            warn("[AppearanceChanger] " .. tostring(err))
+        end
+
+        busyTargets[target] = nil
+    end)
+end
+
+
+
+--==================================================
+-- LOCAL HUMANOID DISPLAY NAME OVERRIDE
+-- Uses Roblox's native overhead name display (no BillboardGui).
+-- The local property edit is intended for this client only.
+--==================================================
+
+local function restoreCustomDisplayName(target)
+    local targetsToRestore = {}
+
+    if target then
+        table.insert(targetsToRestore, target)
+    else
+        for player in pairs(activeNameTagStates) do
+            table.insert(targetsToRestore, player)
+        end
+    end
+
+    for _, player in ipairs(targetsToRestore) do
+        local state = activeNameTagStates[player]
+        if state then
+            activeNameTagStates[player] = nil
+
+            if state.characterConnection then
+                pcall(function()
+                    state.characterConnection:Disconnect()
+                end)
+            end
+
+            -- Restore every Humanoid touched by this player's override,
+            -- including Humanoids from characters replaced during a respawn.
+            for humanoid, originalName in pairs(state.originalDisplayNames) do
+                pcall(function()
+                    if humanoid and humanoid.Parent then
+                        humanoid.DisplayName = originalName
+                    end
+                end)
+            end
+            table.clear(state.originalDisplayNames)
+        end
+    end
+end
+
+local function applyNameToHumanoid(state, character)
+    if activeNameTagStates[state.target] ~= state or not character then
+        return false
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+        or character:WaitForChild("Humanoid", 5)
+
+    if not humanoid then
+        return false
+    end
+
+    -- Save the value once so Restore Name can put it back exactly.
+    if state.originalDisplayNames[humanoid] == nil then
+        state.originalDisplayNames[humanoid] = humanoid.DisplayName
+    end
+
+    -- Roblox renders this value using its built-in character nameplate.
+    -- No custom ScreenGui/BillboardGui is created and the game's display
+    -- distance / health-bar settings are left untouched.
+    local ok, err = pcall(function()
+        humanoid.DisplayName = state.customName
+    end)
+    if not ok then
+        warn("[UltimateChangerV5] Could not set Humanoid.DisplayName: " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+local function applyCustomDisplayName(target, customName)
+    if not target or target == LocalPlayer then
+        nameStatus.Text = "STATUS  /  Select another player"
+        return
+    end
+
+    if not target.Parent or not target.Character then
+        nameStatus.Text = "STATUS  /  Target character not found"
+        return
+    end
+
+    customName = tostring(customName or ""):match("^%s*(.-)%s*$")
+    if customName == "" then
+        nameStatus.Text = "STATUS  /  Enter a display label"
+        return
+    end
+
+    if #customName > 32 then
+        nameStatus.Text = "STATUS  /  Name is limited to 32 characters"
+        return
+    end
+
+    -- Re-applying to one player must not clear another player's custom name.
+    restoreCustomDisplayName(target)
+
+    local state = {
+        target = target,
+        customName = customName,
+        originalDisplayNames = {},
+        characterConnection = nil
+    }
+
+    activeNameTagStates[target] = state
+
+    local ok, err = pcall(function()
+        local attached = applyNameToHumanoid(state, target.Character)
+        if not attached then
+            error("Target Humanoid is not ready")
+        end
+
+        state.characterConnection = target.CharacterAdded:Connect(function(newCharacter)
+            task.wait(0.25)
+            if activeNameTagStates[target] == state then
+                local success = applyNameToHumanoid(state, newCharacter)
+                if not success then
+                    nameStatus.Text = "STATUS  /  Waiting for target character"
+                else
+                    nameStatus.Text = "STATUS  /  Native name restored after respawn"
+                end
+            end
+        end)
+    end)
+
+    if not ok then
+        restoreCustomDisplayName(target)
+        nameStatus.Text = "ERROR  /  " .. tostring(err)
+        warn("[UltimateChangerV5] " .. tostring(err))
+        return
+    end
+
+    nameStatus.Text = "STATUS  /  Local Humanoid name applied to @" .. target.Name
+end
+
+
+--==================================================
+-- GUI: SHINGO'S CHANGER V6
+-- Two pages: Appearance + Local Display Name
+--==================================================
+
+local oldGui = PlayerGui:FindFirstChild("AppearanceChanger")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AppearanceChanger"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = PlayerGui
+
+local effectsLayer = Instance.new("Frame")
+effectsLayer.Name = "ClickEffects"
+effectsLayer.BackgroundTransparency = 1
+effectsLayer.Size = UDim2.fromScale(1, 1)
+effectsLayer.Position = UDim2.fromScale(0, 0)
+effectsLayer.Active = false
+effectsLayer.ZIndex = 100
+effectsLayer.Parent = gui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(460, 570)
+main.Position = UDim2.new(0.5, -230, 0.5, -285)
+main.BackgroundColor3 = Color3.fromRGB(20, 28, 40)
+main.BorderSizePixel = 0
+main.Active = true
+main.ClipsDescendants = true
+main.Parent = gui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 13)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(87, 105, 125)
+mainStroke.Transparency = 0.34
+mainStroke.Thickness = 1.1
+mainStroke.Parent = main
+
+local mainGradient = Instance.new("UIGradient")
+mainGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(29, 39, 53)),
+    ColorSequenceKeypoint.new(0.48, Color3.fromRGB(22, 31, 44)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(26, 36, 50))
+})
+mainGradient.Rotation = 18
+mainGradient.Offset = Vector2.new(-0.4, -0.04)
+mainGradient.Parent = main
+
+-- Static dark slate surface with muted blue-grey accents; no animated background.
+
+-- HEADER
+local topbar = Instance.new("Frame")
+topbar.Name = "Topbar"
+topbar.Size = UDim2.new(1, 0, 0, 70)
+topbar.BackgroundColor3 = Color3.fromRGB(43, 57, 74)
+topbar.BorderSizePixel = 0
+topbar.Active = true
+topbar.Parent = main
+
+local topCorner = Instance.new("UICorner")
+topCorner.CornerRadius = UDim.new(0, 13)
+topCorner.Parent = topbar
+
+local topGradient = Instance.new("UIGradient")
+topGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(39, 54, 71)),
+    ColorSequenceKeypoint.new(0.52, Color3.fromRGB(53, 68, 87)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(45, 60, 78))
+})
+topGradient.Parent = topbar
+
+local headerAccent = Instance.new("Frame")
+headerAccent.Name = "HeaderAccent"
+headerAccent.Size = UDim2.new(1, 0, 0, 2)
+headerAccent.Position = UDim2.new(0, 0, 1, -2)
+headerAccent.BackgroundColor3 = Color3.fromRGB(104, 123, 145)
+headerAccent.BorderSizePixel = 0
+headerAccent.Parent = topbar
+
+local headerAccentGradient = Instance.new("UIGradient")
+headerAccentGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(101, 121, 144)),
+    ColorSequenceKeypoint.new(0.55, Color3.fromRGB(87, 107, 130)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(113, 130, 150))
+})
+headerAccentGradient.Parent = headerAccent
+
+local logo = Instance.new("TextLabel")
+logo.Size = UDim2.fromOffset(38, 38)
+logo.Position = UDim2.fromOffset(15, 15)
+logo.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+logo.BackgroundTransparency = 0.84
+logo.Text = "SC"
+logo.TextColor3 = Color3.fromRGB(255, 255, 255)
+logo.TextSize = 11
+logo.Font = Enum.Font.GothamBold
+logo.Parent = topbar
+
+local logoCorner = Instance.new("UICorner")
+logoCorner.CornerRadius = UDim.new(0, 9)
+logoCorner.Parent = logo
+
+local logoGradient = Instance.new("UIGradient")
+logoGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(78, 98, 121)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(91, 110, 134))
+})
+logoGradient.Rotation = 35
+logoGradient.Parent = logo
+
+local logoStroke = Instance.new("UIStroke")
+logoStroke.Color = Color3.fromRGB(165, 181, 199)
+logoStroke.Transparency = 0.68
+logoStroke.Thickness = 1
+logoStroke.Parent = logo
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -128, 0, 30)
+title.Position = UDim2.fromOffset(65, 19)
+title.BackgroundTransparency = 1
+title.Text = "SHINGO'S CHANGER V6"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 18
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextTruncate = Enum.TextTruncate.AtEnd
+title.Parent = topbar
+
+local closeButton = Instance.new("TextButton")
+closeButton.Name = "CloseButton"
+closeButton.Size = UDim2.fromOffset(30, 30)
+closeButton.Position = UDim2.new(1, -42, 0, 10)
+closeButton.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.BackgroundTransparency = 0.78
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.TextSize = 15
+closeButton.Font = Enum.Font.GothamMedium
+closeButton.AutoButtonColor = false
+closeButton.Parent = topbar
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = closeButton
+
+--==================================================
+-- BUTTON FEEDBACK: soft ripple + small blue particle burst.
+--==================================================
+local function spawnClickEffect(button)
+    if not button or not button.Parent then
+        return
+    end
+
+    local center = button.AbsolutePosition + (button.AbsoluteSize / 2)
+    local layerOrigin = effectsLayer.AbsolutePosition
+    local x = center.X - layerOrigin.X
+    local y = center.Y - layerOrigin.Y
+
+    local ring = Instance.new("Frame")
+    ring.Name = "ClickRipple"
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.Position = UDim2.fromOffset(x, y)
+    ring.Size = UDim2.fromOffset(7, 7)
+    ring.BackgroundTransparency = 1
+    ring.BorderSizePixel = 0
+    ring.ZIndex = 110
+    ring.Parent = effectsLayer
+
+    local ringCorner = Instance.new("UICorner")
+    ringCorner.CornerRadius = UDim.new(1, 0)
+    ringCorner.Parent = ring
+
+    local ringStroke = Instance.new("UIStroke")
+    ringStroke.Color = Color3.fromRGB(151, 171, 193)
+    ringStroke.Thickness = 2
+    ringStroke.Transparency = 0.12
+    ringStroke.Parent = ring
+
+    TweenService:Create(ring, TweenInfo.new(0.34, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Size = UDim2.fromOffset(52, 52)
+    }):Play()
+    TweenService:Create(ringStroke, TweenInfo.new(0.34, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Transparency = 1,
+        Thickness = 0.5
+    }):Play()
+    Debris:AddItem(ring, 0.42)
+
+    for i = 1, 7 do
+        local angle = ((math.pi * 2) / 7) * i
+        local startX = x + math.cos(angle) * 4
+        local startY = y + math.sin(angle) * 4
+        local endX = x + math.cos(angle) * math.random(19, 29)
+        local endY = y + math.sin(angle) * math.random(19, 29)
+
+        local dot = Instance.new("Frame")
+        dot.Name = "ClickParticle"
+        dot.AnchorPoint = Vector2.new(0.5, 0.5)
+        dot.Position = UDim2.fromOffset(startX, startY)
+        dot.Size = UDim2.fromOffset(math.random(3, 5), math.random(3, 5))
+        dot.BackgroundColor3 = (i % 2 == 0)
+            and Color3.fromRGB(151, 172, 194)
+            or Color3.fromRGB(196, 208, 222)
+        dot.BorderSizePixel = 0
+        dot.ZIndex = 111
+        dot.Parent = effectsLayer
+
+        local dotCorner = Instance.new("UICorner")
+        dotCorner.CornerRadius = UDim.new(1, 0)
+        dotCorner.Parent = dot
+
+        TweenService:Create(dot, TweenInfo.new(0.27, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Position = UDim2.fromOffset(endX, endY),
+            Size = UDim2.fromOffset(1, 1),
+            BackgroundTransparency = 1
+        }):Play()
+        Debris:AddItem(dot, 0.34)
+    end
+end
+
+local function addButtonFeedback(button)
+    local scale = Instance.new("UIScale")
+    scale.Scale = 1
+    scale.Parent = button
+
+    local pressInfo = TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local releaseInfo = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local activeTween
+
+    local function animate(value, info)
+        if activeTween then
+            activeTween:Cancel()
+        end
+        activeTween = TweenService:Create(scale, info, {Scale = value})
+        activeTween:Play()
+    end
+
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            animate(0.965, pressInfo)
+        end
+    end)
+
+    button.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            animate(1, releaseInfo)
+        end
+    end)
+
+    button.Activated:Connect(function()
+        animate(1, releaseInfo)
+        spawnClickEffect(button)
+    end)
+end
+
+addButtonFeedback(closeButton)
+
+-- NAVIGATION
+local nav = Instance.new("Frame")
+nav.Size = UDim2.new(1, -30, 0, 44)
+nav.Position = UDim2.fromOffset(15, 88)
+nav.BackgroundColor3 = Color3.fromRGB(17, 25, 37)
+nav.BackgroundTransparency = 0.18
+nav.BorderSizePixel = 0
+nav.Parent = main
+local navCorner = Instance.new("UICorner")
+navCorner.CornerRadius = UDim.new(0, 8)
+navCorner.Parent = nav
+
+local navStroke = Instance.new("UIStroke")
+navStroke.Color = Color3.fromRGB(72, 89, 109)
+navStroke.Transparency = 0.58
+navStroke.Thickness = 1
+navStroke.Parent = nav
+
+local function makeTab(text, x)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(0.5, -5, 1, -8)
+    button.Position = UDim2.new(x, 3, 0, 4)
+    button.BackgroundColor3 = Color3.fromRGB(73, 93, 116)
+    button.BackgroundTransparency = 1
+    button.BorderSizePixel = 0
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(214, 224, 236)
+    button.TextSize = 12
+    button.Font = Enum.Font.GothamMedium
+    button.TextTransparency = 0
+    button.TextStrokeColor3 = Color3.fromRGB(225, 232, 241)
+    button.TextStrokeTransparency = 1
+    button.AutoButtonColor = false
+    button.Parent = nav
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = button
+
+    local tabGradient = Instance.new("UIGradient")
+    tabGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(61, 79, 101)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(83, 101, 123))
+    })
+    tabGradient.Rotation = 8
+    tabGradient.Parent = button
+
+    local tabStroke = Instance.new("UIStroke")
+    tabStroke.Color = Color3.fromRGB(105, 123, 145)
+    tabStroke.Transparency = 0.72
+    tabStroke.Thickness = 1
+    tabStroke.Parent = button
+
+    addButtonFeedback(button)
+    return button
+end
+
+local appearanceTab = makeTab("01   APPEARANCE", 0)
+local nameTab = makeTab("02   DISPLAY NAME", 0.5)
+
+local function makePage(name)
+    local page = Instance.new("Frame")
+    page.Name = name
+    page.Size = UDim2.new(1, -30, 1, -166)
+    page.Position = UDim2.fromOffset(15, 143)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.Parent = main
+    return page
+end
+
+local appearancePage = makePage("AppearancePage")
+local namePage = makePage("DisplayNamePage")
+
+local function makeSectionLabel(parent, text, y)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -4, 0, 16)
+    label.Position = UDim2.fromOffset(2, y)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(169, 185, 204)
+    label.TextSize = 10
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = parent
+    return label
+end
+
+local function makeInput(parent, y, placeholder)
+    local wrap = Instance.new("Frame")
+    wrap.Size = UDim2.new(1, -4, 0, 36)
+    wrap.Position = UDim2.fromOffset(2, y)
+    wrap.BackgroundColor3 = Color3.fromRGB(22, 32, 46)
+    wrap.BorderSizePixel = 0
+    wrap.Parent = parent
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 7)
+    corner.Parent = wrap
+
+    local inputGradient = Instance.new("UIGradient")
+    inputGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(29, 41, 57)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(24, 35, 50))
+    })
+    inputGradient.Rotation = 0
+    inputGradient.Parent = wrap
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(78, 97, 119)
+    stroke.Transparency = 0.34
+    stroke.Parent = wrap
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -20, 1, 0)
+    box.Position = UDim2.fromOffset(10, 0)
+    box.BackgroundTransparency = 1
+    box.Text = ""
+    box.PlaceholderText = placeholder
+    box.TextColor3 = Color3.fromRGB(239, 243, 249)
+    box.PlaceholderColor3 = Color3.fromRGB(143, 159, 180)
+    box.Font = Enum.Font.GothamMedium
+    box.TextSize = 13
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.ClearTextOnFocus = false
+    box.Parent = wrap
+    return box
+end
+
+local function makePlayerList(parent, y)
+    local list = Instance.new("ScrollingFrame")
+    list.Size = UDim2.new(1, -4, 0, 145)
+    list.Position = UDim2.fromOffset(2, y)
+    list.BackgroundColor3 = Color3.fromRGB(16, 24, 36)
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 3
+    list.ScrollBarImageColor3 = Color3.fromRGB(112, 132, 154)
+    list.CanvasSize = UDim2.new()
+    list.Parent = parent
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = list
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(72, 90, 111)
+    stroke.Transparency = 0.42
+    stroke.Parent = list
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 5)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = list
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 7)
+    padding.PaddingBottom = UDim.new(0, 7)
+    padding.PaddingLeft = UDim.new(0, 7)
+    padding.PaddingRight = UDim.new(0, 7)
+    padding.Parent = list
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        list.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y + 14)
+    end)
+    return list
+end
+
+local function makeSelectedLabel(parent, y)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -4, 0, 20)
+    label.Position = UDim2.fromOffset(2, y)
+    label.BackgroundTransparency = 1
+    label.Text = "SELECTED PLAYER  /  NONE"
+    label.TextColor3 = Color3.fromRGB(229, 235, 243)
+    label.TextSize = 11
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Parent = parent
+    return label
+end
+
+local function makeStatus(parent, y, defaultText)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -4, 0, 24)
+    label.Position = UDim2.fromOffset(2, y)
+    label.BackgroundTransparency = 1
+    label.Text = defaultText
+    label.TextColor3 = Color3.fromRGB(145, 193, 174)
+    label.TextSize = 10
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Parent = parent
+    return label
+end
+
+local function makeButton(parent, text, x, color1, color2, iconText)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(0.5, -5, 0, 43)
+    button.Position = UDim2.new(x, x == 0 and 2 or 3, 0, 0)
+    button.BackgroundColor3 = color1
+    button.BorderSizePixel = 0
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
+    button.TextSize = 11
+    button.Font = Enum.Font.GothamMedium
+    button.AutoButtonColor = false
+    button.Parent = parent
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = button
+    local gradient = Instance.new("UIGradient")
+    gradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, color1),
+        ColorSequenceKeypoint.new(1, color2)
+    })
+    gradient.Rotation = 10
+    gradient.Parent = button
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(105, 124, 146)
+    stroke.Transparency = 0.36
+    stroke.Thickness = 1.1
+    stroke.Parent = button
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.fromOffset(22, 22)
+    icon.Position = UDim2.fromOffset(9, 10.5)
+    icon.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    icon.BackgroundTransparency = 0.82
+    icon.Text = iconText
+    icon.TextColor3 = Color3.new(1, 1, 1)
+    icon.TextSize = 12
+    icon.Font = Enum.Font.GothamBold
+    icon.Parent = button
+    local iconStroke = Instance.new("UIStroke")
+    iconStroke.Color = Color3.fromRGB(255, 255, 255)
+    iconStroke.Transparency = 0.9
+    iconStroke.Parent = icon
+    local iconCorner = Instance.new("UICorner")
+    iconCorner.CornerRadius = UDim.new(0, 5)
+    iconCorner.Parent = icon
+
+    button.MouseEnter:Connect(function()
+        TweenService:Create(stroke, TweenInfo.new(0.14), {
+            Transparency = 0.1,
+            Thickness = 1.5
+        }):Play()
+    end)
+    button.MouseLeave:Connect(function()
+        TweenService:Create(stroke, TweenInfo.new(0.16), {
+            Transparency = 0.48,
+            Thickness = 1
+        }):Play()
+    end)
+    addButtonFeedback(button)
+    return button
+end
+
+-- PAGE 1: APPEARANCE
+makeSectionLabel(appearancePage, "PLAYERS", 0)
+local searchBox = makeInput(appearancePage, 19, "Search player...")
+local playerList = makePlayerList(appearancePage, 63)
+local selectedLabel = makeSelectedLabel(appearancePage, 215)
+makeSectionLabel(appearancePage, "AVATAR USERNAME / ID", 243)
+local usernameBox = makeInput(appearancePage, 262, "Username or UserId")
+status = makeStatus(appearancePage, 305, "STATUS  /  Ready")
+
+local appearanceActions = Instance.new("Frame")
+appearanceActions.Size = UDim2.new(1, -4, 0, 43)
+appearanceActions.Position = UDim2.fromOffset(2, 341)
+appearanceActions.BackgroundTransparency = 1
+appearanceActions.Parent = appearancePage
+
+local applyButton = makeButton(
+    appearanceActions, "APPLY AVATAR", 0,
+    Color3.fromRGB(67, 88, 112), Color3.fromRGB(86, 106, 130), "A"
+)
+local restoreButton = makeButton(
+    appearanceActions, "RESTORE SELECTED", 0.5,
+    Color3.fromRGB(63, 91, 96), Color3.fromRGB(81, 108, 112), "R"
+)
+
+-- PAGE 2: LOCAL DISPLAY NAME
+makeSectionLabel(namePage, "PLAYERS", 0)
+local nameSearchBox = makeInput(namePage, 19, "Search player...")
+local namePlayerList = makePlayerList(namePage, 63)
+local nameSelectedLabel = makeSelectedLabel(namePage, 215)
+makeSectionLabel(namePage, "DISPLAY NAME", 243)
+local customNameBox = makeInput(namePage, 262, "Display name")
+nameStatus = makeStatus(namePage, 305, "STATUS  /  Ready")
+
+local nameActions = Instance.new("Frame")
+nameActions.Size = UDim2.new(1, -4, 0, 43)
+nameActions.Position = UDim2.fromOffset(2, 341)
+nameActions.BackgroundTransparency = 1
+nameActions.Parent = namePage
+
+local applyNameButton = makeButton(
+    nameActions, "APPLY NAME", 0,
+    Color3.fromRGB(67, 88, 112), Color3.fromRGB(86, 106, 130), "N"
+)
+local restoreNameButton = makeButton(
+    nameActions, "RESTORE SELECTED", 0.5,
+    Color3.fromRGB(63, 91, 96), Color3.fromRGB(81, 108, 112), "R"
+)
+
+-- PAGE SWITCHING
+local currentPage = "Appearance"
+local function setPage(which)
+    currentPage = which
+    local isAppearance = which == "Appearance"
+    appearancePage.Visible = isAppearance
+    namePage.Visible = not isAppearance
+
+    appearanceTab.BackgroundTransparency = isAppearance and 0 or 1
+    appearanceTab.TextColor3 = isAppearance
+        and Color3.fromRGB(255, 255, 255)
+        or Color3.fromRGB(214, 224, 236)
+
+    nameTab.BackgroundTransparency = isAppearance and 1 or 0
+    nameTab.TextColor3 = not isAppearance
+        and Color3.fromRGB(255, 255, 255)
+        or Color3.fromRGB(214, 224, 236)
+end
+
+connect(appearanceTab.Activated, function()
+    setPage("Appearance")
+end)
+connect(nameTab.Activated, function()
+    setPage("Name")
+end)
+setPage("Appearance")
+
+-- DRAG HEADER
+local dragging = false
+local dragStart
+local startPosition
+local dragInput
+
+connect(topbar.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPosition = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+connect(topbar.InputChanged, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if dragging and dragInput and input == dragInput then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- PLAYER LISTS
+local selectedNamePlayer
+
+local function populatePlayerList(list, search, getSelected, setSelected, selectedText)
+    for _, child in ipairs(list:GetChildren()) do
+        if child:IsA("TextButton") or child.Name == "EmptyState" then
+            child:Destroy()
+        end
+    end
+
+    local query = string.lower(search.Text)
+    local found = false
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local searchable = string.lower(player.Name .. " " .. player.DisplayName)
+            if query == "" or string.find(searchable, query, 1, true) then
+                found = true
+                local isSelected = getSelected() == player
+                local button = Instance.new("TextButton")
+                button.Size = UDim2.new(1, -4, 0, 31)
+                button.BackgroundColor3 = isSelected
+                    and Color3.fromRGB(72, 94, 119)
+                    or Color3.fromRGB(29, 40, 55)
+                button.BorderSizePixel = 0
+                button.Text = "   " .. player.DisplayName .. "   (@" .. player.Name .. ")"
+                button.TextColor3 = Color3.fromRGB(239, 243, 249)
+                button.TextStrokeColor3 = Color3.fromRGB(144, 160, 181)
+                button.TextStrokeTransparency = 1
+                button.Font = Enum.Font.GothamMedium
+                button.TextSize = 12
+                button.TextXAlignment = Enum.TextXAlignment.Left
+                button.AutoButtonColor = false
+                button.Parent = list
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius = UDim.new(0, 6)
+                corner.Parent = button
+                addButtonFeedback(button)
+                button.Activated:Connect(function()
+                    setSelected(player)
+                    selectedText.Text = "SELECTED PLAYER  /  " .. player.Name
+                    -- Refresh both lists so selection is consistent on page switches.
+                    task.defer(function()
+                        refreshAppearancePlayers()
+                        refreshNamePlayers()
+                    end)
+                end)
+            end
+        end
+    end
+
+    if not found then
+        local empty = Instance.new("TextLabel")
+        empty.Name = "EmptyState"
+        empty.Size = UDim2.new(1, -8, 0, 30)
+        empty.BackgroundTransparency = 1
+        empty.Text = "No matching players found"
+        empty.TextColor3 = Color3.fromRGB(147, 164, 185)
+        empty.Font = Enum.Font.GothamMedium
+        empty.TextSize = 12
+        empty.Parent = list
+    end
+end
+
+refreshAppearancePlayers = function()
+    populatePlayerList(
+        playerList,
+        searchBox,
+        function() return selectedPlayer end,
+        function(player) selectedPlayer = player end,
+        selectedLabel
+    )
+end
+
+refreshNamePlayers = function()
+    populatePlayerList(
+        namePlayerList,
+        nameSearchBox,
+        function() return selectedNamePlayer end,
+        function(player) selectedNamePlayer = player end,
+        nameSelectedLabel
+    )
+end
+
+connect(searchBox:GetPropertyChangedSignal("Text"), refreshAppearancePlayers)
+connect(nameSearchBox:GetPropertyChangedSignal("Text"), refreshNamePlayers)
+connect(Players.PlayerAdded, function()
+    refreshAppearancePlayers()
+    refreshNamePlayers()
+end)
+connect(Players.PlayerRemoving, function(player)
+    if selectedPlayer == player then
+        selectedPlayer = nil
+        selectedLabel.Text = "SELECTED PLAYER  /  NONE"
+    end
+    if selectedNamePlayer == player then
+        selectedNamePlayer = nil
+        nameSelectedLabel.Text = "SELECTED PLAYER  /  NONE"
+    end
+    if activeAppearanceStates[player] then
+        restoreAppearance(player)
+        status.Text = "STATUS  /  Target left"
+    end
+    if activeNameTagStates[player] then
+        restoreCustomDisplayName(player)
+        nameStatus.Text = "STATUS  /  Target left"
+    end
+    refreshAppearancePlayers()
+    refreshNamePlayers()
+end)
+
+-- BUTTON EVENTS
+connect(applyButton.Activated, function()
+    applyAppearance(selectedPlayer, usernameBox.Text:match("^%s*(.-)%s*$"))
+end)
+connect(restoreButton.Activated, function()
+    if not selectedPlayer then
+        status.Text = "STATUS  /  Select a player first"
+        return
+    end
+    restoreAppearance(selectedPlayer)
+    status.Text = "STATUS  /  Original appearance restored for @" .. selectedPlayer.Name
+end)
+connect(applyNameButton.Activated, function()
+    applyCustomDisplayName(
+        selectedNamePlayer,
+        customNameBox.Text
+    )
+end)
+connect(restoreNameButton.Activated, function()
+    if not selectedNamePlayer then
+        nameStatus.Text = "STATUS  /  Select a player first"
+        return
+    end
+    restoreCustomDisplayName(selectedNamePlayer)
+    nameStatus.Text = "STATUS  /  Original display label restored for @" .. selectedNamePlayer.Name
+end)
+
+-- CLOSE / REOPEN
+connect(closeButton.Activated, function()
+    main.Visible = false
+end)
+connect(UserInputService.InputBegan, function(input)
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        if UserInputService:GetFocusedTextBox() then
+            return
+        end
+        main.Visible = not main.Visible
+    end
+end)
+
+-- CLEANUP
+_G.AppearanceChangerCleanup = function()
+    restoreAppearance()
+    restoreCustomDisplayName()
+
+    for _, connection in ipairs(connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(connections)
+
+    if gui and gui.Parent then
+        gui:Destroy()
+    end
+end
+
+refreshAppearancePlayers()
+refreshNamePlayers()
